@@ -1,6 +1,9 @@
 import { Context, Schema, Session } from 'koishi'
 import { ChatContext } from 'koishi-plugin-byd-ai'
 
+import path, { join } from 'path'
+import fs from 'fs/promises'
+
 export const name = 'situation-puzzle'
 
 export const inject = {
@@ -13,11 +16,14 @@ interface Scene {
   answer: string
 }
 
+type GetSceneMethod = "从配置中" | "从用户输入中" | "从服务器中"
+
 export interface Config {
   scenes: Scene[]
   aiSummary: boolean
   aiResummarizing: number
   aiSuggestion: boolean
+  getSceneMethod: GetSceneMethod[]
 }
 
 const defaultScenes: Scene[] = [
@@ -67,6 +73,7 @@ export const Config: Schema<Config> = Schema.object({
   aiSummary: Schema.boolean().default(false).description("是否开启AI总结功能"),
   aiResummarizing: Schema.number().default(0).description("AI对现有总结进行整理所需的次数（为0时关闭该功能）（目前该功能处于实验性，不建议开启，若开启，可能导致大量token消耗）").experimental(),
   aiSuggestion: Schema.boolean().default(false).description("是否开启AI建议功能"),
+  getSceneMethod: Schema.array(Schema.union(["从配置中", "从用户输入中", "从服务器中"])).default(["从配置中", "从用户输入中"]).role("checkbox").description("获取场景的方式"),
   scenes: Schema.array(Schema.object({
     prompt: Schema.string().role('textarea').description("汤面"),
     answer: Schema.string().role('textarea').description("汤底")
@@ -80,9 +87,39 @@ interface Talk {
   ctx: ChatContext
   players: { id: number, name: string }[]
   talking: boolean
+  sceneId: string
   scene: Scene
   summary: string[]
   info: string[]
+}
+
+interface SceneWithId {
+  id: string
+  scene: Scene
+}
+
+interface LocalData {
+  channelAlreadyRandomScene: {
+    [channelId: string]: string[]
+  }
+  inputScenes: SceneWithId[]
+  configScenes: SceneWithId[]
+}
+
+function generateId(getSceneMethod: GetSceneMethod, length: number = 8) {
+  const chars = '0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ'
+  let id = ''
+  for (let i = 0; i < length; i++) {
+    id += chars[Math.floor(Math.random() * chars.length)]
+  }
+  let prefix = getSceneMethod === '从配置中' ? "config-" : getSceneMethod === '从用户输入中' ? 'input-' : 'server-'
+  return prefix + id
+}
+
+function parseSceneType(id: string): GetSceneMethod {
+  if (id.startsWith("config-")) return '从配置中'
+  else if (id.startsWith("input-")) return '从用户输入中'
+  else if (id.startsWith("server-")) return '从服务器中'
 }
 
 async function getUserId(ctx: Context, session: Session) {
@@ -90,23 +127,19 @@ async function getUserId(ctx: Context, session: Session) {
   return userId
 }
 
-function createTalk(c: Context, s: Session, cc: ChatContext, scene: Scene): Talk {
+function createTalk(c: Context, s: Session, cc: ChatContext, scene: Scene, sceneId: string): Talk {
   return {
     platform: s.platform,
     channelId: s.channelId,
     playerId: s.userId,
     ctx: cc,
+    sceneId,
     players: [],
     talking: false,
     scene,
     summary: [],
     info: []
   }
-}
-
-function randomScene(list: Scene[]): Scene {
-  const index = Math.floor(Math.random() * list.length)
-  return list[index]
 }
 
 function getCueWord(scene: Scene) {
@@ -133,24 +166,104 @@ function parseResponse(res: string): ResponseType | "invalid_response" {
   else return "invalid_response"
 }
 
+async function readOrCreateFile(path: string, defaultValue: string = '') {
+  try {
+    // 尝试访问文件
+    await fs.access(path, fs.constants.F_OK)
+    // 文件存在则读取
+    return await fs.readFile(path, 'utf8')
+  } catch {
+    // 文件不存在则创建
+    await fs.writeFile(path, defaultValue)
+    return defaultValue
+  }
+}
+
 export function apply(ctx: Context, cfg: Config) {
+  const LOCAL_DATA_DIR_PATH = path.join(ctx.baseDir, "data", "ac", "situation-puzzle")
+  const LOCAL_DATA_FILE_PATH = path.join(LOCAL_DATA_DIR_PATH, "data.json")
+
+  const compareScene = (first: Scene, second: Scene) => first.prompt === second.prompt ? first.answer === second.answer ? true : false : false
+
+  const randomScene = async (channelId: string) => {
+    let sceneList: SceneWithId[] = []
+    localData.channelAlreadyRandomScene[channelId] || (localData.channelAlreadyRandomScene[channelId] = [])
+
+    if (cfg.getSceneMethod.includes("从配置中")) sceneList.push(...localData.configScenes)
+    if (cfg.getSceneMethod.includes("从用户输入中")) sceneList.push(...localData.inputScenes)
+    if (cfg.getSceneMethod.includes("从服务器中")) {
+      let scenes: SceneWithId[]
+      try {
+        const abortController = new AbortController()
+        ctx.setTimeout(() => abortController.abort(), 5 * 1000)
+        scenes = JSON.parse(await ctx.http.get("https://public.ac-official.net/v1/api/situation-puzzle/get-scenes", { signal: abortController.signal }))
+      } catch (e) {
+        ctx.logger.error(e)
+        scenes = !cfg.getSceneMethod.includes("从配置中") && !cfg.getSceneMethod.includes("从用户输入中") ? [...localData.configScenes, ...localData.inputScenes] : []
+      }
+      sceneList.push(...scenes)
+    }
+
+    if (sceneList.every(s => localData.channelAlreadyRandomScene[channelId].includes(s.id))) localData.channelAlreadyRandomScene[channelId] = []
+    sceneList = sceneList.filter(s => !localData.channelAlreadyRandomScene[channelId].includes(s.id))
+
+    const index = Math.floor(Math.random() * sceneList.length)
+    return sceneList[index]
+  }
+
+
   let talks: Talk[] = []
+  let localData: LocalData
+
+  const saveLocalData = async () => await fs.writeFile(LOCAL_DATA_FILE_PATH, JSON.stringify(localData, null, 2))
+
+  ctx.on('ready', async () => {
+    await fs.mkdir(LOCAL_DATA_DIR_PATH, { recursive: true })
+    const defaultData: LocalData = {
+      channelAlreadyRandomScene: {},
+      inputScenes: [],
+      configScenes: []
+    }
+    const str = await readOrCreateFile(LOCAL_DATA_FILE_PATH, JSON.stringify(defaultData, null, 2))
+    localData = JSON.parse(str)
+
+    const remainingConfigScene = localData.configScenes.length === 0 ? cfg.scenes : cfg.scenes.filter(s => !localData.configScenes.map(s => s.scene).some(cs => compareScene(cs, s)))
+    for (const scene of remainingConfigScene) {
+      localData.configScenes.push({
+        id: generateId("从配置中"),
+        scene
+      })
+    }
+
+    const redundantConfigScene = localData.configScenes.map(s => s.scene).filter(s => !cfg.scenes.some(cs => compareScene(cs, s)))
+    localData.configScenes = localData.configScenes.filter(s => !redundantConfigScene.some(rcs => compareScene(rcs, s.scene)))
+
+    await saveLocalData()
+
+    ctx.setInterval(async () => {
+      await saveLocalData()
+    }, 1 * 60 * 60 * 1000)
+  })
+
+  ctx.on('dispose', async () => {
+    await saveLocalData()
+  })
 
   ctx.command("开始海龟汤")
   .action(async ({session}) => {
-    const scene = randomScene(cfg.scenes)
+    const scene = await randomScene(session.channelId)
     const chatCtx = ctx.bydAI.createChatContext()
     chatCtx.addSystemMessage({
       role: "system",
-      content: getCueWord(scene)
+      content: getCueWord(scene.scene)
     })
-    const talk = createTalk(ctx, session, chatCtx, scene)
+    const talk = createTalk(ctx, session, chatCtx, scene.scene, scene.id)
     talk.players.push({
       name: session.username,
       id: await getUserId(ctx, session)
     })
     talks.push(talk)
-    return scene.prompt
+    return scene.scene.prompt
   })
 
   ctx.command("talk <...nsg>")
@@ -199,6 +312,7 @@ export function apply(ctx: Context, cfg: Config) {
       case "correct_scene": {
         await session.send("猜测正确！")
         result = talk.scene.answer
+        localData.channelAlreadyRandomScene[session.channelId].push(talk.sceneId)
         break
       }
     }
@@ -308,4 +422,33 @@ export function apply(ctx: Context, cfg: Config) {
     talks = talks.filter(t => t !== talk)
     return "你已结束该对话"
   })
+
+  if (cfg.getSceneMethod.includes("从用户输入中")) {
+    ctx.command("登记场景")
+    .action(async ({session}) => {
+      const awaitUserInput = (): Promise<string> => {
+        return new Promise(resolve => {
+          const cancelListener = ctx.on("message", s => {
+            if (s.platform === session.platform && s.channelId === session.channelId && s.userId === session.userId) {
+              cancelListener()
+              resolve(s.content)
+            }
+          })
+        })
+      }
+
+      await session.send("请输入汤面")
+      const prompt = await awaitUserInput()
+      await session.send("请输入汤底")
+      const answer = await awaitUserInput()
+
+      localData.inputScenes.push({
+        id: generateId("从用户输入中"),
+        scene: {
+          prompt,
+          answer
+        }
+      })
+    })
+  }
 }
